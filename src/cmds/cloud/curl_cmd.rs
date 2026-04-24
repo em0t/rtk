@@ -1,4 +1,4 @@
-//! Runs curl and applies a simple truncation with tee hint if the output is too long.
+//! Runs curl and preserves JSON responses while truncating long non-JSON output.
 
 use crate::core::tee::force_tee_hint;
 use crate::core::tracking;
@@ -56,6 +56,18 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
 
 fn filter_curl_output(raw: &str) -> FilterResult {
     let trimmed = raw.trim();
+
+    // Valid JSON responses need values for API inspection and downstream parsers.
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && (trimmed.ends_with('}') || trimmed.ends_with(']'))
+        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
+    {
+        return FilterResult {
+            content: trimmed.to_string(),
+            tee_hint: None,
+        };
+    }
+
     let tee_hint = force_tee_hint(raw, "curl");
 
     // If the output is too long and we have a tee hint, truncate the output.
@@ -87,6 +99,64 @@ mod tests {
     fn test_filter_curl_json_small_no_tee_hint() {
         let output = r#"{"r2Ready":true,"status":"ok"}"#;
         let result = filter_curl_output(output);
+        assert_eq!(result.content, output);
+        assert!(result.tee_hint.is_none());
+    }
+
+    #[test]
+    fn test_filter_curl_json() {
+        // API JSON preserves values instead of collapsing to schema.
+        let output = r#"{"name": "a very long user name here", "count": 42, "items": [1, 2, 3], "description": "a very long description that takes up many characters in the original JSON payload", "status": "active", "url": "https://example.com/api/v1/users/123"}"#;
+        let result = filter_curl_output(output);
+        assert_eq!(result.content, output);
+        assert!(result.content.contains("a very long user name here"));
+        assert!(result.content.contains("42"));
+    }
+
+    #[test]
+    fn test_filter_curl_json_array() {
+        let output = r#"[{"id": 1}, {"id": 2}]"#;
+        let result = filter_curl_output(output);
+        assert!(result.content.contains("id"));
+    }
+
+    #[test]
+    fn test_filter_curl_single_line_json_array_preserves_values() {
+        let output = r#"[{"name":"baoyu-article-illustrator","type":"dir"},{"name":"baoyu-comic","type":"dir"},{"name":"baoyu-url-to-markdown","type":"dir"}]"#;
+        let result = filter_curl_output(output);
+        assert_eq!(result.content, output);
+        assert!(result.content.contains("baoyu-article-illustrator"));
+        assert!(result.content.contains("baoyu-url-to-markdown"));
+    }
+
+    #[test]
+    fn test_filter_curl_multiline_json_preserves_values() {
+        let output = r#"{
+  "description": "a very long description that takes up many characters in the original JSON payload",
+  "name": "a very long user name here",
+  "count": 42,
+  "items": [1, 2, 3],
+  "status": "active",
+  "url": "https://example.com/api/v1/users/123"
+}"#;
+        let result = filter_curl_output(output);
+        assert_eq!(result.content, output);
+        assert!(result.content.contains("a very long user name here"));
+        assert!(result
+            .content
+            .contains("https://example.com/api/v1/users/123"));
+    }
+
+    #[test]
+    fn test_filter_curl_long_json_has_no_tee_hint() {
+        let output = format!(
+            r#"{{"items":[{}]}}"#,
+            (0..80)
+                .map(|i| format!(r#"{{"name":"item-{i}","type":"dir"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let result = filter_curl_output(&output);
         assert_eq!(result.content, output);
         assert!(result.tee_hint.is_none());
     }
